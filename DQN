@@ -1,0 +1,223 @@
+# =========================================================
+# Deep Reinforcement Learning for Portfolio Optimization
+# DQN-based implementation 
+# =========================================================
+
+
+import numpy as np
+import pandas as pd
+import gym
+from gym import spaces
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+from collections import deque
+import matplotlib.pyplot as plt
+
+# Fix seeds for reproducibility
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+random.seed(SEED)
+
+def generate_price_data(n_assets=5, n_days=800):
+    prices = np.zeros((n_days, n_assets))
+    prices[0] = 100
+
+    for t in range(1, n_days):
+        returns = np.random.normal(0.0005, 0.01, n_assets)
+        prices[t] = prices[t-1] * (1 + returns)
+
+    dates = pd.date_range("2020-01-01", periods=n_days)
+    return pd.DataFrame(prices, index=dates, columns=[f"Asset_{i}" for i in range(n_assets)])
+
+price_df = generate_price_data()
+
+returns = price_df.pct_change().dropna()
+ma = price_df.rolling(window=20).mean().dropna()
+volatility = returns.rolling(window=20).std().dropna()
+
+data = pd.concat([returns, ma, volatility], axis=1).dropna()
+
+
+class PortfolioEnv(gym.Env):
+    def __init__(self, data, n_assets):
+        super(PortfolioEnv, self).__init__()
+
+        self.data = data.values
+        self.n_assets = n_assets
+        self.current_step = 0
+
+        # Discrete actions: increase/decrease weights
+        self.action_space = spaces.Discrete(3 ** n_assets)
+
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(self.data.shape[1],), dtype=np.float32
+        )
+
+        self.weights = np.ones(n_assets) / n_assets
+
+    def reset(self):
+        self.current_step = 0
+        self.weights = np.ones(self.n_assets) / self.n_assets
+        return self.data[self.current_step]
+
+    def step(self, action):
+        action_vector = self._decode_action(action)
+
+        self.weights += 0.01 * action_vector
+        self.weights = np.clip(self.weights, 0, 1)
+        self.weights /= np.sum(self.weights)
+
+        asset_returns = self.data[self.current_step][:self.n_assets]
+        portfolio_return = np.dot(self.weights, asset_returns)
+
+        reward = portfolio_return / (np.std(asset_returns) + 1e-6)
+
+        self.current_step += 1
+        done = self.current_step >= len(self.data) - 1
+
+        next_state = self.data[self.current_step]
+
+        return next_state, reward, done, {}
+
+    def _decode_action(self, action):
+        base = 3
+        vec = []
+        for _ in range(self.n_assets):
+            vec.append((action % base) - 1)
+            action //= base
+        return np.array(vec)
+
+class DQN(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(DQN, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, output_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class ReplayBuffer:
+    def __init__(self, capacity=10000):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        return map(np.array, (states, actions, rewards, next_states, dones))
+
+    def __len__(self):
+        return len(self.buffer)
+
+env = PortfolioEnv(data, n_assets=5)
+
+state_dim = env.observation_space.shape[0]
+action_dim = env.action_space.n
+
+policy_net = DQN(state_dim, action_dim)
+target_net = DQN(state_dim, action_dim)
+target_net.load_state_dict(policy_net.state_dict())
+
+optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
+buffer = ReplayBuffer()
+
+gamma = 0.99
+epsilon = 1.0
+epsilon_min = 0.05
+epsilon_decay = 0.995
+batch_size = 64
+episodes = 50
+target_update = 10
+
+
+reward_log = []
+
+for ep in range(episodes):
+    state = env.reset()
+    ep_reward = 0
+
+    while True:
+        if random.random() < epsilon:
+            action = env.action_space.sample()
+        else:
+            with torch.no_grad():
+                q_vals = policy_net(torch.FloatTensor(state))
+                action = torch.argmax(q_vals).item()
+
+        next_state, reward, done, _ = env.step(action)
+        buffer.push(state, action, reward, next_state, done)
+
+        state = next_state
+        ep_reward += reward
+
+        if len(buffer) >= batch_size:
+            states, actions, rewards, next_states, dones = buffer.sample(batch_size)
+
+            states = torch.FloatTensor(states)
+            actions = torch.LongTensor(actions)
+            rewards = torch.FloatTensor(rewards)
+            next_states = torch.FloatTensor(next_states)
+            dones = torch.FloatTensor(dones)
+
+            q_values = policy_net(states).gather(1, actions.unsqueeze(1)).squeeze()
+            next_q = target_net(next_states).max(1)[0]
+            target = rewards + gamma * next_q * (1 - dones)
+
+            loss = nn.MSELoss()(q_values, target)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        if done:
+            break
+
+    epsilon = max(epsilon_min, epsilon * epsilon_decay)
+    reward_log.append(ep_reward)
+
+    if ep % target_update == 0:
+        target_net.load_state_dict(policy_net.state_dict())
+
+    print(f"Episode {ep+1}/{episodes}, Reward: {ep_reward:.4f}, Epsilon: {epsilon:.4f}")
+
+def backtest(env, policy=None):
+    state = env.reset()
+    total_return = 0
+
+    while True:
+        if policy:
+            with torch.no_grad():
+                action = torch.argmax(policy(torch.FloatTensor(state))).item()
+        else:
+            action = env.action_space.sample()
+
+        state, reward, done, _ = env.step(action)
+        total_return += reward
+
+        if done:
+            break
+
+    return total_return
+
+dqn_performance = backtest(env, policy_net)
+baseline_performance = backtest(env, None)
+
+print("\n===== FINAL RESULTS =====")
+print(f"DQN Policy Return: {dqn_performance:.4f}")
+print(f"Equal Weight Baseline Return: {baseline_performance:.4f}")
+
+plt.plot(reward_log)
+plt.title("DQN Training Rewards")
+plt.xlabel("Episode")
+plt.ylabel("Reward")
+plt.show()
