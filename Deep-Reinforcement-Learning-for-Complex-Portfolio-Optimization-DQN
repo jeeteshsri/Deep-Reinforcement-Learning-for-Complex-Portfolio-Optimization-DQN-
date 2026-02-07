@@ -1,0 +1,240 @@
+# ============================================================
+# Deep Reinforcement Learning for Portfolio Optimization (DQN)
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import random
+from collections import deque
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+SEED = 42
+np.random.seed(SEED)
+random.seed(SEED)
+torch.manual_seed(SEED)
+def generate_gbm_prices(n_assets=5, n_days=3*252):
+    """
+    Generate synthetic asset prices using Geometric Brownian Motion
+    """
+    prices = []
+    for _ in range(n_assets):
+        mu = np.random.uniform(0.05, 0.15)
+        sigma = np.random.uniform(0.15, 0.3)
+        dt = 1/252
+
+        price = [100]
+        for _ in range(n_days-1):
+            price.append(
+                price[-1] * np.exp((mu - 0.5*sigma**2)*dt + sigma*np.sqrt(dt)*np.random.randn())
+            )
+        prices.append(price)
+
+    df = pd.DataFrame(np.array(prices).T,
+                      columns=[f"Asset_{i}" for i in range(n_assets)])
+    return df
+
+prices = generate_gbm_prices()
+
+returns = prices.pct_change().dropna()
+
+# Train / Test split
+split_idx = int(len(returns) * 0.8)
+train_returns = returns.iloc[:split_idx]
+test_returns = returns.iloc[split_idx:]
+
+class PortfolioEnv:
+    """
+    Custom Portfolio Optimization Environment
+    """
+
+    def __init__(self, returns, window=20):
+        self.returns = returns.values
+        self.n_assets = returns.shape[1]
+        self.window = window
+        self.reset()
+
+    def reset(self):
+        self.t = self.window
+        self.portfolio_weights = np.ones(self.n_assets) / self.n_assets
+        self.history = []
+        return self._get_state()
+
+    def _get_state(self):
+        """
+        State = recent returns + current portfolio weights
+        """
+        state_returns = self.returns[self.t-self.window:self.t].flatten()
+        return np.concatenate([state_returns, self.portfolio_weights])
+
+    def step(self, action):
+        """
+        Action space:
+        0 = Hold
+        1 = Shift weight toward asset i (cyclic)
+        """
+        if action > 0:
+            asset = (action - 1) % self.n_assets
+            self.portfolio_weights *= 0.95
+            self.portfolio_weights[asset] += 0.05
+            self.portfolio_weights /= self.portfolio_weights.sum()
+
+        daily_ret = np.dot(self.portfolio_weights, self.returns[self.t])
+        self.history.append(daily_ret)
+
+        reward = self._sharpe_reward()
+
+        self.t += 1
+        done = self.t >= len(self.returns)
+
+        return self._get_state(), reward, done
+
+    def _sharpe_reward(self):
+        if len(self.history) < 2:
+            return 0.0
+        mean = np.mean(self.history)
+        std = np.std(self.history) + 1e-8
+        return mean / std
+
+class DQN(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class DQNAgent:
+    def __init__(self, state_dim, action_dim):
+        self.action_dim = action_dim
+        self.memory = deque(maxlen=10000)
+
+        self.gamma = 0.99
+        self.epsilon = 1.0
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.995
+        self.lr = 1e-3
+
+        self.policy_net = DQN(state_dim, action_dim)
+        self.target_net = DQN(state_dim, action_dim)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
+        self.loss_fn = nn.MSELoss()
+
+    def act(self, state):
+        if np.random.rand() < self.epsilon:
+            return random.randrange(self.action_dim)
+        state = torch.FloatTensor(state).unsqueeze(0)
+        with torch.no_grad():
+            return torch.argmax(self.policy_net(state)).item()
+
+    def remember(self, s, a, r, s_, d):
+        self.memory.append((s, a, r, s_, d))
+
+    def replay(self, batch_size=64):
+        if len(self.memory) < batch_size:
+            return
+
+        batch = random.sample(self.memory, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+
+        states = torch.FloatTensor(states)
+        next_states = torch.FloatTensor(next_states)
+        actions = torch.LongTensor(actions).unsqueeze(1)
+        rewards = torch.FloatTensor(rewards)
+        dones = torch.FloatTensor(dones)
+
+        q_values = self.policy_net(states).gather(1, actions).squeeze()
+        next_q = self.target_net(next_states).max(1)[0]
+        target = rewards + self.gamma * next_q * (1 - dones)
+
+        loss = self.loss_fn(q_values, target.detach())
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        self.epsilon = max(self.epsilon*self.epsilon_decay, self.epsilon_min)
+
+    def update_target(self):
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+
+env = PortfolioEnv(train_returns)
+state_dim = len(env.reset())
+action_dim = env.n_assets + 1
+
+agent = DQNAgent(state_dim, action_dim)
+
+episodes = 50
+rewards_log = []
+
+for ep in range(episodes):
+    state = env.reset()
+    total_reward = 0
+
+    while True:
+        action = agent.act(state)
+        next_state, reward, done = env.step(action)
+        agent.remember(state, action, reward, next_state, done)
+        agent.replay()
+        state = next_state
+        total_reward += reward
+        if done:
+            break
+
+    agent.update_target()
+    rewards_log.append(total_reward)
+
+    print(f"Episode {ep+1}/{episodes} | Reward: {total_reward:.3f} | Epsilon: {agent.epsilon:.3f}")
+
+def backtest_policy(agent, returns):
+    env = PortfolioEnv(returns)
+    state = env.reset()
+    portfolio_returns = []
+
+    while True:
+        action = agent.act(state)
+        state, _, done = env.step(action)
+        portfolio_returns.append(env.history[-1])
+        if done:
+            break
+
+    return np.array(portfolio_returns)
+
+rl_returns = backtest_policy(agent, test_returns)
+eq_returns = test_returns.mean(axis=1).values[:len(rl_returns)]
+
+def sharpe(returns):
+    return np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252)
+
+def max_drawdown(returns):
+    cumulative = np.cumprod(1 + returns)
+    peak = np.maximum.accumulate(cumulative)
+    return np.min((cumulative - peak) / peak)
+
+results = pd.DataFrame({
+    "Strategy": ["DQN Portfolio", "Equal Weight"],
+    "Sharpe Ratio": [sharpe(rl_returns), sharpe(eq_returns)],
+    "Max Drawdown": [max_drawdown(rl_returns), max_drawdown(eq_returns)]
+})
+
+print("\nFinal Backtest Comparison:")
+print(results)
+
+
+plt.figure(figsize=(12,5))
+plt.plot(np.cumprod(1+rl_returns), label="DQN Portfolio")
+plt.plot(np.cumprod(1+eq_returns), label="Equal Weight")
+plt.title("Backtest Performance Comparison")
+plt.legend()
+plt.grid(True)
+plt.show()
